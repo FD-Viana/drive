@@ -6,18 +6,23 @@
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:Georgia,serif;background:#FAFAF8;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .box{background:#fff;border-radius:14px;border:0.5px solid rgba(0,0,0,0.12);padding:36px 40px;max-width:480px;width:90%;text-align:center;box-shadow:0 4px 32px rgba(0,0,0,0.1)}
+  .box{background:#fff;border-radius:14px;border:0.5px solid rgba(0,0,0,0.12);padding:36px 40px;max-width:500px;width:90%;text-align:center;box-shadow:0 4px 32px rgba(0,0,0,0.1)}
   .logo{font-size:36px;margin-bottom:10px}
   .brand{font-size:15px;font-weight:500;color:#3C3489;margin-bottom:4px}
   .sub{font-size:12px;color:#8C5A2B;margin-bottom:20px;font-style:italic}
   p{font-size:13px;color:#6B6960;line-height:1.6;margin-bottom:12px}
   .spinner{display:inline-block;width:24px;height:24px;border:2.5px solid #AFA9EC;border-top-color:#3C3489;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:14px}
   @keyframes spin{to{transform:rotate(360deg)}}
-  .status{font-size:13px;padding:10px 14px;border-radius:8px;margin:12px 0;text-align:left}
+  .status{font-size:13px;padding:12px 16px;border-radius:8px;margin:12px 0;text-align:left;line-height:1.6}
   .ok{background:#EAF3DE;color:#27500A;border:0.5px solid #8BC34A}
   .err{background:#FCEBEB;color:#A32D2D;border:0.5px solid #F09595}
-  .btn{background:#3C3489;color:#EEEDFE;border:none;border-radius:8px;padding:10px 28px;font-size:14px;cursor:pointer;font-family:inherit;margin-top:10px}
+  .warn{background:#FAEEDA;color:#633806;border:0.5px solid #FAC775}
+  .btn{background:#3C3489;color:#EEEDFE;border:none;border-radius:8px;padding:10px 28px;font-size:14px;cursor:pointer;font-family:inherit;margin-top:12px;display:inline-block}
   .btn:hover{background:#26215C}
+  .btn-copy{background:#EAF3DE;color:#27500A;border:0.5px solid #8BC34A;border-radius:8px;padding:8px 18px;font-size:13px;cursor:pointer;font-family:inherit;margin-top:8px}
+  textarea{width:100%;height:60px;font-family:monospace;font-size:11px;padding:8px;border-radius:6px;border:1px solid #AFA9EC;margin-top:8px;resize:none}
+  .step{font-size:13px;color:#6B6960;text-align:left;margin-top:10px;line-height:1.8}
+  .step b{color:#1A1916}
 </style>
 </head>
 <body>
@@ -27,46 +32,139 @@
   <div class="sub">by Thais Fialho</div>
   <div id="content">
     <div class="spinner"></div>
-    <p>Processando autorização do Google Drive...</p>
+    <p>Processando autorização...</p>
   </div>
 </div>
 
 <script>
-const content = document.getElementById('content');
-
-// Get the authorization code from the URL (Google redirects here with ?code=...)
 const params = new URLSearchParams(window.location.search);
-const code = params.get('code');
-const error = params.get('error');
+const code   = params.get('code');
+const error  = params.get('error');
+
+// client_id and client_secret are passed via localStorage key that the
+// gerenciador writes before opening this window
+// We read them from the opener's localStorage via postMessage handshake,
+// OR from the URL hash if the gerenciador encoded them there.
+// Best approach: read from opener directly.
+
+const el = document.getElementById('content');
 
 if (error) {
-  content.innerHTML = `<div class="status err">❌ Acesso negado: ${error}.<br>Feche esta aba e tente novamente.</div>`;
+  el.innerHTML = `<div class="status err">❌ Acesso negado: ${error}.<br>Feche esta aba e tente novamente.</div>`;
 } else if (!code) {
-  content.innerHTML = `<div class="status err">Código de autorização não encontrado. Tente novamente.</div>`;
+  el.innerHTML = `<div class="status err">Código de autorização não encontrado na URL. Tente novamente.</div>`;
 } else {
-  // Send the code to the opener window (the gerenciador)
-  // The gerenciador will exchange it for tokens using a CORS proxy
-  if (window.opener && !window.opener.closed) {
-    try {
-      window.opener.postMessage({ type: 'DRIVE_CODE', code: code }, '*');
-      content.innerHTML = `
-        <div class="status ok">✅ Autorização recebida! Conectando ao sistema...</div>
-        <p>Esta aba será fechada automaticamente em instantes.</p>`;
-      setTimeout(() => window.close(), 2500);
-    } catch(e) {
-      showCodeManually(code);
+  // Try to get credentials from opener localStorage
+  tryConnect();
+}
+
+async function tryConnect() {
+  el.innerHTML = `<div class="spinner"></div><p>Trocando código por token...</p>`;
+
+  // Try to read credentials from opener
+  let clientId = '', clientSecret = '', redirectUri = '';
+  try {
+    if (window.opener && !window.opener.closed) {
+      const raw = window.opener.localStorage.getItem('conf_drive_v1');
+      if (raw) {
+        const d = JSON.parse(raw);
+        clientId = d.clientId || '';
+        clientSecret = d.clientSecret || '';
+      }
+      redirectUri = window.opener.location.href.split('?')[0]; // not needed
     }
-  } else {
-    showCodeManually(code);
+  } catch(e) {}
+
+  // callback page URL is the redirect_uri
+  redirectUri = window.location.origin + window.location.pathname;
+
+  if (!clientId || !clientSecret) {
+    showManualInput(code);
+    return;
+  }
+
+  await exchangeCode(clientId, clientSecret, redirectUri, code);
+}
+
+async function exchangeCode(clientId, clientSecret, redirectUri, code) {
+  const body = new URLSearchParams({
+    code,
+    client_id: clientId,
+    client_secret: clientSecret,
+    redirect_uri: redirectUri,
+    grant_type: 'authorization_code'
+  });
+
+  try {
+    const resp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+    const data = await resp.json();
+
+    if (data.access_token) {
+      // Send token back to opener
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({
+          type: 'DRIVE_TOKEN',
+          access_token: data.access_token,
+          refresh_token: data.refresh_token || '',
+          expires_in: data.expires_in || 3599
+        }, '*');
+        el.innerHTML = `
+          <div class="status ok">✅ Conectado com sucesso!<br>Esta aba será fechada automaticamente.</div>
+          <p style="margin-top:10px">Volte para o Gerenciador — a conexão foi estabelecida.</p>
+          <button class="btn" onclick="window.close()">Fechar esta aba</button>`;
+        setTimeout(() => { try { window.close(); } catch(e) {} }, 2000);
+      } else {
+        // Opener closed — show tokens to paste
+        showTokens(data.access_token, data.refresh_token || '', data.expires_in || 3599);
+      }
+    } else {
+      el.innerHTML = `<div class="status err">❌ Erro do Google: ${data.error_description || data.error || 'resposta inválida'}</div>
+        <p style="margin-top:8px">Verifique se o Client ID e Client Secret estão corretos.</p>`;
+    }
+  } catch(e) {
+    // fetch failed (very unlikely on GitHub Pages HTTPS)
+    el.innerHTML = `<div class="status err">Erro de rede: ${e.message}</div>`;
   }
 }
 
-function showCodeManually(code) {
-  content.innerHTML = `
-    <div class="status ok">✅ Autorização concedida pelo Google!</div>
-    <p style="margin-top:10px">A janela do gerenciador foi fechada. Copie o código abaixo e cole no sistema manualmente:</p>
-    <textarea style="width:100%;height:70px;font-family:monospace;font-size:11px;padding:8px;border-radius:6px;border:1px solid #AFA9EC;margin-top:8px;resize:none">${code}</textarea>
-    <button class="btn" onclick="navigator.clipboard.writeText('${code}').then(()=>this.textContent='✅ Copiado!')">Copiar código</button>`;
+function showTokens(accessToken, refreshToken, expiresIn) {
+  const payload = JSON.stringify({ type: 'DRIVE_TOKEN', access_token: accessToken, refresh_token: refreshToken, expires_in: expiresIn });
+  el.innerHTML = `
+    <div class="status warn">A janela do gerenciador foi fechada. Copie o bloco abaixo e cole na aba do Drive → campo "Token manual":</div>
+    <textarea id="token-area">${payload}</textarea>
+    <button class="btn-copy" onclick="copyIt()">📋 Copiar</button>`;
+}
+
+function showManualInput(code) {
+  // Credentials not accessible — ask user to paste client_id/secret here
+  el.innerHTML = `
+    <div class="status warn">⚠️ Não foi possível ler as credenciais automaticamente.<br>Cole o Client ID e o Client Secret abaixo para finalizar a conexão.</div>
+    <div class="step"><b>Client ID:</b><input id="m-cid" style="width:100%;margin-top:4px;padding:6px 8px;border-radius:6px;border:1px solid #AFA9EC;font-size:12px;font-family:monospace" placeholder="xxxxx.apps.googleusercontent.com"></div>
+    <div class="step" style="margin-top:8px"><b>Client Secret:</b><input id="m-sec" style="width:100%;margin-top:4px;padding:6px 8px;border-radius:6px;border:1px solid #AFA9EC;font-size:12px;font-family:monospace" placeholder="GOCSPX-xxxxx"></div>
+    <button class="btn" onclick="manualExchange('${code.replace(/'/g,"\\'")}')">Conectar</button>
+    <div id="m-err" style="color:#A32D2D;font-size:12px;margin-top:8px;display:none"></div>`;
+}
+
+async function manualExchange(code) {
+  const cid = document.getElementById('m-cid').value.trim();
+  const sec = document.getElementById('m-sec').value.trim();
+  const errEl = document.getElementById('m-err');
+  if (!cid || !sec) { errEl.textContent='Preencha os dois campos.'; errEl.style.display='block'; return; }
+  errEl.style.display='none';
+  el.querySelector('.btn').textContent='Conectando...';
+  const redirectUri = window.location.origin + window.location.pathname;
+  await exchangeCode(cid, sec, redirectUri, code);
+}
+
+function copyIt() {
+  const t = document.getElementById('token-area');
+  navigator.clipboard.writeText(t.value).then(() => {
+    document.querySelector('.btn-copy').textContent = '✅ Copiado!';
+  });
 }
 </script>
 </body>
